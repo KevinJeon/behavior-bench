@@ -1,3 +1,11 @@
+# BehaviorBench
+
+This is the companion code for the benchmarking study reported in the paper "Scaling RL for Autonomous Driving Is Not Enough: Behavior Benchmark for True Generalization", submitted to NeurIPS2026. The paper can be found here http://arxiv.org/abs/xxxx.xxxx. The code allows the users to reproduce and extend the results reported in the study. Please cite the above paper when reporting, reproducing or extending the results.
+
+This software is a research prototype, solely developed for and published as part of the publication above.
+
+The companion code is a fork of [PufferDrive](https://github.com/Emerge-Lab/PufferDrive/). Below are instructions in setting up PufferDrive as well as the BehaviorBench additions.
+
 # PufferDrive
 
 <img align="left" style="width:260px" src="https://github.com/Emerge-Lab/PufferDrive/blob/main/pufferlib/resources/drive/pufferdrive_20fps_long.gif" width="288px">
