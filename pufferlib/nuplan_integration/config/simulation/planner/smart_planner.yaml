@@ -1,0 +1,11 @@
+smart_planner:
+  _target_: pufferlib.nuplan_integration.smart_planner.SMARTNuPlanPlanner
+  _convert_: all
+  weights_path: ${oc.env:SMART_WEIGHTS_PATH,}
+  device: cpu
+  temperature: 1.0
+  greedy: true
+  shift: 5
+  num_historical_steps: 11
+  trajectory_steps: 80
+  trajectory_dt: 0.1

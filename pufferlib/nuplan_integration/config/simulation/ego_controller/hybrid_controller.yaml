@@ -1,0 +1,6 @@
+_target_: pufferlib.nuplan_integration.hybrid_controller.HybridEgoController
+_convert_: 'all'
+
+defaults:
+  - tracker: lqr_tracker
+  - motion_model: kinematic_bicycle_model

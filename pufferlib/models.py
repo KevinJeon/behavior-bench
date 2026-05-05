@@ -1,3 +1,10 @@
+# Copyright (c) 2026 Copyright holder of the paper "Scaling RL for Autonomous Driving Is Not Enough: A Behavior Benchmark for True Generalization" submitted to NeurIPS2026 for review.
+# SPDX-License-Identifier: AGPL-3.0
+#
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive/)
+# Copyright (c) 2026 PufferDrive, licensed under the MIT license.
+
 import numpy as np
 
 import torch
@@ -142,14 +149,16 @@ class LSTMWrapper(nn.Module):
         # hidden = self.pre_layernorm(hidden)
         hidden, c = self.cell(hidden, lstm_state)
         # hidden = self.post_layernorm(hidden)
+        # state is changed here and goes back to pufferl
         state["hidden"] = hidden
         state["lstm_h"] = hidden
         state["lstm_c"] = c
         logits, values = self.policy.decode_actions(hidden)
         return logits, values
 
-    def forward(self, observations, state):
+    def forward(self, observations, state, trunc_or_term_before, episode_ended=False):
         """Forward function for training. Uses LSTM for fast time-batching"""
+        device = observations.device
         x = observations
         lstm_h = state["lstm_h"]
         lstm_c = state["lstm_c"]
@@ -167,33 +176,84 @@ class LSTMWrapper(nn.Module):
             raise ValueError("Invalid input tensor shape", x.shape)
 
         if lstm_h is not None:
-            assert lstm_h.shape[1] == lstm_c.shape[1] == B, "LSTM state must be (h, c)"
+            assert lstm_h.shape[0] == lstm_c.shape[0] == B, "LSTM state must be (h, c)"
+            # assert lstm_h.shape[1] == lstm_c.shape[1] == B, "LSTM state must be (h, c)"
             lstm_state = (lstm_h, lstm_c)
         else:
             lstm_state = None
 
-        x = x.reshape(B * TT, *space_shape)
-        hidden = self.policy.encode_observations(x, state)
-        assert hidden.shape == (B * TT, self.input_size)
 
-        hidden = hidden.reshape(B, TT, self.input_size)
 
-        hidden = hidden.transpose(0, 1)
-        # hidden = self.pre_layernorm(hidden)
-        hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
-        hidden = hidden.float()
+        # x = x.reshape(B * TT, *space_shape)
+        # hidden = self.policy.encode_observations(x, state)
+        # assert hidden.shape == (B * TT, self.input_size)
 
-        # hidden = self.post_layernorm(hidden)
-        hidden = hidden.transpose(0, 1)
+        # hidden = hidden.reshape(B, TT, self.input_size)
 
-        flat_hidden = hidden.reshape(B * TT, self.hidden_size)
-        logits, values = self.policy.decode_actions(flat_hidden)
-        values = values.reshape(B, TT)
-        # state.batch_logits = logits.reshape(B, TT, -1)
-        state["hidden"] = hidden
-        state["lstm_h"] = lstm_h.detach()
-        state["lstm_c"] = lstm_c.detach()
-        return logits, values
+        # hidden = hidden.transpose(0, 1)
+        # # hidden = self.pre_layernorm(hidden)
+        # hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
+        # hidden = hidden.float()
+
+        # # hidden = self.post_layernorm(hidden)
+        # hidden = hidden.transpose(0, 1)
+
+        # flat_hidden = hidden.reshape(B * TT, self.hidden_size)
+        # logits, values = self.policy.decode_actions(flat_hidden)
+        # values = values.reshape(B, TT)
+        # # state.batch_logits = logits.reshape(B, TT, -1)
+        # state["hidden"] = hidden
+        # state["lstm_h"] = lstm_h.detach()
+        # state["lstm_c"] = lstm_c.detach()
+
+        values = torch.zeros(B, TT, device=device)
+        logits = torch.zeros(B, TT, sum(self.policy.atn_dim), device=device)
+        for t in range(TT):
+            # at timestep 0, the lstm_state should be 0 anyways
+            mask = trunc_or_term_before[:, t] == 1.0 # the step before was a truncation, lstm state should be set to 0
+            # 2. Get current states
+            h = state["lstm_h"]
+            c = state["lstm_c"]
+
+            # 3. Apply the reset mask
+            if h is not None:
+                h = torch.where(mask.unsqueeze(-1), torch.zeros_like(h), h)
+                c = torch.where(mask.unsqueeze(-1), torch.zeros_like(c), c)
+            state_timestep = {
+                    "action": state["action"][:, t, :],
+                    "lstm_h": h,
+                    "lstm_c": c
+                }
+            # state_timestep = state.copy()
+            # state_timestep["action"] = state["action"][:, t, :]
+            hidden = self.policy.encode_observations(x[:, t, :], state_timestep)
+            h = state_timestep["lstm_h"]
+            c = state_timestep["lstm_c"]
+            if h is not None:
+                assert h.shape[0] == c.shape[0] == x[:, t, :].shape[0], "LSTM state must be (h, c)"
+                lstm_state = (h, c)
+            else:
+                lstm_state = None
+            hidden, c = self.cell(hidden, lstm_state)
+            # hidden = self.post_layernorm(hidden)
+            # state is changed here and goes back to pufferl
+            state["hidden"] = hidden
+            state["lstm_h"] = hidden
+            state["lstm_c"] = c
+            logits_timestep, values_timestep = self.policy.decode_actions(hidden)
+            logits[:, t, :] = logits_timestep[0]
+            values[:, t] = values_timestep.flatten()
+
+        if episode_ended:
+            state["lstm_h"] = state["lstm_h"].detach()
+            state["lstm_c"] = state["lstm_c"].detach()
+        logits = logits.reshape(B*TT, sum(self.policy.atn_dim))
+        logits_tuple = (logits,)
+
+
+        # if lstm_h is not None:
+        #     print("Wihuuu lstm is not None???")
+        return logits_tuple, values
 
 
 class Convolutional(nn.Module):

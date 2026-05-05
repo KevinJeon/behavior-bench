@@ -1,0 +1,18 @@
+Slurm Training & Sweep Infrastructure for Puffer DriveThis repository contains the infrastructure for launching PufferLib training jobs and distributed hyperparameter sweeps on a Slurm-based HPC cluster.The system handles:Data Staging: Automatically copies training data from slow network storage to fast local NVMe ($TMPDIR) on the compute node.Result Syncing: Automatically syncs logs and checkpoints back to persistent storage, even if the job times out or is cancelled.Distributed Sweeps: Launches multiple independent workers that coordinate via WandB to perform Bayesian Optimization (using puffer sweep).⚡ Quick Start1. ConfigurationCreate a .slurm.env file in the scripts/ directory with your secrets and paths:# scripts/.slurm.env
+export WANDB_API_KEY="your_wandb_key_here"
+export DRIVE_DATA_ROOT="/path/to/network/drive"
+export DRIVE_BINARIES_DATA_ROOT="/path/to/network/drive/binaries"
+export RESULTS_DIR="/path/to/network/drive/experiments"
+2. Launch a Sweep (5 Workers)This command submits 5 Slurm jobs. Each job acts as an independent worker finding the best hyperparameters../scripts/submit_job.sh \
+  --partition gpu \
+  --wall_time 12:00:00 \
+  --num_jobs 5 \
+  --project puffer-drive-sweep-v1 \
+  --max-runs 50
+📂 ArchitectureFileDescriptionsubmit_job.shThe Entry Point. Parses arguments, exports environment variables, and submits sbatch commands to the cluster.run_train.shThe Worker. Runs on the compute node. Handles data copying, environment activation, running the Python code, and syncing results back..slurm.envConfig. Stores API keys and file paths. Ignored by git.🚀 Usage Guide1. Running Distributed SweepsWe utilize the native puffer sweep functionality (which uses Client-Side Bayesian Optimization via Protein/Carbs).To scale up the sweep, simply increase --num_jobs. The workers share the same WandB Project history to determine the next best parameters efficiently../scripts/submit_job.sh \
+    --partition gpu \
+    --wall_time 24:00:00 \
+    --num_jobs 10 \
+    --project my-sweep-project
+--num_jobs 10: Launches 10 concurrent GPU jobs.--project ...: All workers will read/write to this WandB project.Extra Args: Any arguments after the named flags are passed directly to puffer sweep (e.g., --learning-rate 0.001 to force a static value, or --max-runs to limit trials per worker).2. Data Management & LogsInput Data:The script copies data from $DRIVE_BINARIES_DATA_ROOT to $TMPDIR/data on the compute node before training starts. This prevents network bottlenecks.Output Data:Results are saved locally to $TMPDIR/output during training.Success: When training finishes, results are synced to $RESULTS_DIR/<project_name>/<job_id>/.Failure/Timeout: A trap function ensures that even if the job hits the wall time or is cancelled, the logs generated so far are synced back to $RESULTS_DIR.🔧 Advanced ConfigurationModifying the Training CommandThe execution logic resides in scripts/run_train.sh.Default Behavior: Runs puffer sweep.To Run Standard Training: Edit scripts/run_train.sh and comment out the sweep command, uncommenting puffer train.Environment Variables (.slurm.env)VariablePurposeWANDB_API_KEYAuth token for logging to Weights & Biases.DRIVE_BINARIES_DATA_ROOTSource path for large binary data (synced to compute node).RESULTS_DIRDestination path where experiments/checkpoints are saved.🐛 TroubleshootingJob fails immediately:Check the standard error logs in scripts/slurm/logs/.cat scripts/slurm/logs/<project_name>_<job_id>.err
+WandB Login Error:Ensure WANDB_API_KEY is set correctly in scripts/.slurm.env.Disk Quota Exceeded:The scripts use $TMPDIR for training. Ensure the compute nodes have enough local scratch space for your dataset.

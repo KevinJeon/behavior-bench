@@ -1,0 +1,35 @@
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+_convert_: 'all'
+
+scenario_types:
+  - behind_pedestrian_on_pickup_dropoff
+  - near_multiple_vehicles
+  - high_magnitude_jerk
+  - crossed_by_vehicle
+  - following_lane_with_lead
+  - changing_lane_to_left
+  - accelerating_at_traffic_light_without_lead
+  - stopping_at_stop_sign_with_lead
+  - traversing_narrow_lane
+  - waiting_for_pedestrian_to_cross
+  - starting_left_turn
+  - starting_high_speed_turn
+  - starting_unprotected_cross_turn
+  - starting_protected_noncross_turn
+  - on_pickup_dropoff
+scenario_tokens: null
+
+log_names: null
+map_names: null
+
+num_scenarios_per_type: 1
+limit_total_scenarios: null
+timestamp_threshold_s: null
+ego_displacement_minimum_m: null
+ego_start_speed_threshold: null
+ego_stop_speed_threshold: null
+speed_noise_tolerance: null
+
+expand_scenarios: false
+remove_invalid_goals: false
+shuffle: false

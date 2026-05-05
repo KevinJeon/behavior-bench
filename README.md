@@ -1,7 +1,5 @@
 # PufferDrive
 
-[![Unit Tests](https://github.com/Emerge-Lab/PufferDrive/actions/workflows/utest.yml/badge.svg)](https://github.com/Emerge-Lab/PufferDrive/actions/workflows/utest.yml)
-
 <img align="left" style="width:260px" src="https://github.com/Emerge-Lab/PufferDrive/blob/main/pufferlib/resources/drive/pufferdrive_20fps_long.gif" width="288px">
 
 **PufferDrive is a fast and friendly driving simulator to train and test RL-based models.**
@@ -66,18 +64,260 @@ Start a training run
 puffer train puffer_drive
 ```
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [EVALUATION.md](EVALUATION.md) | Planner evaluation framework (eval.py) - ego planners vs traffic controllers |
+| [REALISM_EVALUATION.md](REALISM_EVALUATION.md) | WOSAC realism evaluation (eval_realism.py) - distributional realism metrics |
+| [BENCHMARK.md](BENCHMARK.md) | Interactive benchmark extraction from Waymo data |
+| [TRAINING.md](TRAINING.md) | PufferRL PPO training configuration and usage |
+| [PREDICTION.md](PREDICTION.md) | SMART prediction model - architecture, training, evaluation |
+| [NUPLAN.md](NUPLAN.md) | nuPlan integration - evaluate PufferDrive planners on nuPlan |
+
+---
+
+## Planner Evaluation
+
+PufferDrive includes a config-driven evaluation framework for testing different planning algorithms as ego planners and traffic controllers. See [EVALUATION.md](EVALUATION.md) for comprehensive documentation.
+
+### Pre-trained Weights
+
+The repository includes pre-trained weights in `weights/`:
+
+| File | Description |
+|------|-------------|
+| `weights/simple_ppo.pt` | PPO policy trained with self-play and simple reward on WOMD |
+| `weights/conditioned_ppo.pt` | Conditioned PPO policy trained with self-play on WOMD |
+| `weights/smart_epoch_030.pt` | SMART prediction model (1M params, 30 epochs) |
+
+### Benchmark Splits
+
+We provide two curated evaluation splits:
+
+| Split | Name | Description |
+|-------|------|-------------|
+| `interactive1k` | **Interactive1k** | 1,000 most interactive WOMD validation scenarios |
+| `random1k` | **Random1k** | 1,000 random WOMD validation scenarios |
+
+See [BENCHMARK.md](BENCHMARK.md) for data preprocessing, download instructions and benchmark details.
+
+### Available Planners
+
+| Planner | Description |
+|---------|-------------|
+| `pdm` | Predictive Driver Model. Proposes trajectory candidates via IDM with different velocities/offsets, selects best. |
+| `ppo` | Pre-trained RL policy with LSTM. Requires checkpoint weights. |
+| `smart` | SMART autoregressive trajectory prediction. Requires trained weights. |
+| `idm` | Intelligent Driver Model. Rule-based lane-following. |
+| `hybrid` | PPO + PDM |
+| `conditioned_aggr` / `conditioned_normal` / `conditioned_caut` | Reward-conditioned PPO variants. |
+| `constant_velocity` | Baseline that maintains current velocity. |
+
+### Available Traffic Agents
+
+| Traffic Agent | Description |
+|---------------|-------------|
+| `idm` | Intelligent Driver Model. Default traffic controller, rule-based lane-following. |
+| `pdm` | Predictive Driver Model used as traffic. |
+| `ppo` | Pre-trained RL policy used for traffic agents. Requires checkpoint weights. |
+| `smart` | SMART autoregressive trajectory prediction for traffic. Requires trained weights. |
+| `conditioned_mix` / `conditioned_aggr` / `conditioned_normal` / `conditioned_caut` | Reward-conditioned PPO traffic variants. |
+| `expert` | Ground truth trajectory replay from the Waymo dataset (traffic only). |
+| `constant_velocity` | Baseline that maintains current velocity. |
+
+### Quick Start
+
+```bash
+export DRIVE_BINARIES_DATA_ROOT=/path/to/binaries
+
+# PDM ego vs IDM traffic (default)
+python pufferlib/ocean/benchmark/eval.py --map-ids 0-10
+
+# SMART ego planner (using provided weights)
+python pufferlib/ocean/benchmark/eval.py --planner.type smart \
+    --planner.smart.weights-path weights/smart_1M_epoch_029.pt --map-ids 0-10
+
+# PPO ego vs SMART traffic (using provided weights)
+python pufferlib/ocean/benchmark/eval.py --planner.type ppo \
+    --planner.ppo.weights-path weights/ppo_self_play.pt \
+    --traffic.type smart --traffic.smart.weights-path weights/smart_1M_epoch_029.pt
+
+# Enable visualization
+python pufferlib/ocean/benchmark/eval.py --eval.viz True --map-ids 5
+```
+
+---
+
+## RL Training with PufferRL
+
+PufferDrive uses [PufferLib](https://puffer.ai/) for RL training with PPO (Proximal Policy Optimization). Training is configured via INI config files and command-line overrides.
+
+### Basic Training
+
+```bash
+# Start training with default config
+puffer train puffer_drive
+
+# Train with custom parameters
+puffer train puffer_drive --train.learning-rate 0.001 --train.batch-size 262144
+
+# Resume from checkpoint
+puffer train puffer_drive --load-model-path experiments/puffer_drive/checkpoints/model_001000.pt
+
+# Evaluate a trained model
+puffer eval puffer_drive --load-model-path experiments/puffer_drive/checkpoints/model_001000.pt
+```
+
+### Training Workflow
+
+1. **Environment Creation**: Multiple vectorized Drive environments are created across `num_workers` processes, each managing `num_envs` environments
+2. **Experience Collection**: The policy collects rollouts of length `bptt_horizon` across all environments simultaneously, filling a batch of size `batch_size`
+3. **Policy Update**: The batch is split into `minibatch_size` chunks and PPO gradient updates are applied
+4. **Repeat**: Steps 2-3 repeat until `total_timesteps` is reached
+5. **Checkpointing**: Model weights are saved every `checkpoint_interval` updates to `experiments/puffer_drive/checkpoints/`
+
+### Configuration Files
+
+The training configuration is defined in two INI files:
+- **`pufferlib/config/default.ini`**: Base defaults for all environments
+- **`pufferlib/config/ocean/drive.ini`**: Drive-specific overrides
+
+Any parameter can be overridden via command-line: `--section.parameter value`
+
+### Environment Parameters (`[env]`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_agents` | 1024 | Total agents managed per environment instance (across all loaded maps) |
+| `action_type` | `continuous` | Action space type: `discrete` (7x13=91 actions) or `continuous` |
+| `dynamics_model` | `classic` | Vehicle dynamics: `classic` (acceleration + steering) or `jerk` (jerk-based, 4x3=12 actions) |
+| `dt` | 0.1 | Simulation timestep in seconds (10 Hz, matching WOMD) |
+| `episode_length` | 91 | Steps per episode (91 steps = 9.1 seconds, full WOMD scenario) |
+| `num_maps` | 80000 | Number of map binaries to load |
+| `split` | `training` | Dataset split: `training`, `validation`, `testing`, or custom path |
+| `init_steps` | 0 | Initial trajectory steps to skip (0 = start from beginning) |
+| `control_mode` | `control_vehicles` | Which agents to control: `control_vehicles`, `control_agents`, `control_wosac`, `control_sdc_only` |
+| `init_mode` | `create_all_valid` | Agent creation: `create_all_valid` (all agents) or `create_only_controlled` |
+| `resample_frequency` | 910 | How often to resample new scenarios (in steps) |
+| `termination_mode` | 1 | 0 = terminate at `episode_length`, 1 = terminate after all agents are done |
+
+**Reward Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `reward_vehicle_collision` | -0.5 | Penalty for colliding with another vehicle |
+| `reward_offroad_collision` | -0.5 | Penalty for going off-road |
+| `reward_goal` | 1.0 | Reward for reaching the goal |
+| `reward_goal_post_respawn` | 0.25 | Reward for reaching goals after first respawn |
+
+**Goal Behavior:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `goal_behavior` | 3 | What happens when an agent reaches its goal: 0=respawn at start, 1=generate new goal, 2=stop, 3=remove agent |
+| `goal_radius` | 2.0 | Distance threshold (meters) to consider goal reached |
+| `goal_speed` | 100.0 | Maximum target speed towards goal (m/s) |
+| `goal_target_distance` | 30.0 | Distance for newly generated goals (when `goal_behavior=1`) |
+
+**Collision/Offroad Handling:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `collision_behavior` | 2 | On collision: 0=ignore, 1=stop agent, 2=remove agent |
+| `offroad_behavior` | 2 | On offroad: 0=ignore, 1=stop agent, 2=remove agent |
+
+### PPO Training Parameters (`[train]`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `total_timesteps` | 2,000,000,000 | Total training steps (2 billion) |
+| `learning_rate` | 0.003 | Initial learning rate |
+| `anneal_lr` | True | Linearly anneal learning rate to 0 |
+| `batch_size` | 524288 | Total samples per training epoch (= `num_agents * num_workers * bptt_horizon`) |
+| `minibatch_size` | 32768 | Mini-batch size for gradient updates |
+| `bptt_horizon` | 32 | Backpropagation-through-time horizon (sequence length per update) |
+| `gamma` | 0.98 | Discount factor |
+| `gae_lambda` | 0.95 | GAE smoothing parameter |
+| `clip_coef` | 0.2 | PPO clipping coefficient |
+| `vf_coef` | 2.0 | Value function loss weight |
+| `vf_clip_coef` | 0.2 | Value function clipping coefficient |
+| `ent_coef` | 0.005 | Entropy bonus coefficient (encourages exploration) |
+| `max_grad_norm` | 1.0 | Gradient clipping norm |
+| `update_epochs` | 1 | Number of PPO epochs per batch |
+| `checkpoint_interval` | 1000 | Save model every N updates |
+
+**Optimizer Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `optimizer` | `muon` | Optimizer: `adam` or `muon` |
+| `adam_beta1` | 0.9 | Adam beta1 (momentum) |
+| `adam_beta2` | 0.999 | Adam beta2 (RMSProp-like) |
+| `adam_eps` | 1e-8 | Adam epsilon for numerical stability |
+
+**Advanced Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `prio_alpha` | 0.85 | Priority experience sampling alpha |
+| `prio_beta0` | 0.85 | Priority experience sampling beta |
+| `vtrace_rho_clip` | 1.0 | V-trace rho clipping (importance sampling) |
+| `vtrace_c_clip` | 1.0 | V-trace c clipping |
+
+### Vectorization Parameters (`[vec]`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `num_workers` | 16 | Number of parallel worker processes |
+| `num_envs` | 16 | Number of environments per worker |
+| `batch_size` | 4 | Environments per batch in vectorized stepping |
+
+### Policy Architecture (`[policy]`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `input_size` | 64 | First hidden layer size |
+| `hidden_size` | 256 | Main hidden layer size |
+
+### Observation Space
+
+The observation is a flat vector with three components:
+
+1. **Ego features** (7 for classic, 10 for jerk dynamics):
+   - Position relative to goal, speed, heading, steering, acceleration
+
+2. **Partner features** (7 per agent, max 31 agents = 217):
+   - Relative position, speed, heading, distance to each nearby agent
+
+3. **Road features** (7 per segment, max 128 segments = 896):
+   - Relative position, orientation, type for nearest road segments
+
+Total observation size: 7 + 217 + 896 = **1120** (classic dynamics)
+
+### Hyperparameter Sweeps
+
+```bash
+# Run a sweep over learning rate, entropy, and gamma
+puffer sweep puffer_drive
+```
+
+Sweep ranges are defined in `drive.ini` under `[sweep.*]` sections.
+
+### Evaluation Modes
+
+```bash
+# Standard evaluation
+puffer eval puffer_drive --load-model-path model.pt
+
+# WOSAC realism evaluation (distributional metrics)
+puffer eval puffer_drive --eval.wosac-realism-eval True --load-model-path model.pt
+
+# Human replay evaluation (SDC only, others follow logs)
+puffer eval puffer_drive --eval.human-replay-eval True --load-model-path model.pt
+```
+
+---
+
 ## Dataset
 
 <details>
 <summary>Downloading and using data</summary>
-
-### Data preparation
-
-To train with PufferDrive, you need to convert JSON files to map binaries. Run the following command with the path to your data folder:
-
-```bash
-python pufferlib/ocean/drive/drive.py
-```
 
 ### Downloading Waymo Data
 
@@ -209,7 +449,7 @@ To edit the browser demo, follow these steps:
 If you use PufferDrive in your research, please cite:
 ```bibtex
 @software{pufferdrive2025github,
-  author = {Daphne Cornelisse* and Spencer Cheng* and Pragnay Mandavilli and Julian Hunt and Kevin Joseph and Waël Doulazmi and Valentin Charraut and Aditya Gupta and Joseph Suarez and Eugene Vinitsky},
+  author = {Daphne Cornelisse* and Spencer Cheng* and Pragnay Mandavilli and Julian Hunt and Kevin Joseph and Waël Doulazmi and Aditya Gupta and Eugene Vinitsky},
   title = {{PufferDrive}: A Fast and Friendly Driving Simulator for Training and Evaluating {RL} Agents},
   url = {https://github.com/Emerge-Lab/PufferDrive},
   version = {2.0.0},

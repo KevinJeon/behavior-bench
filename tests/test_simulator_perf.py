@@ -1,3 +1,10 @@
+# Copyright (c) 2026 Copyright holder of the paper "Scaling RL for Autonomous Driving Is Not Enough: A Behavior Benchmark for True Generalization" submitted to NeurIPS2026 for review.
+# SPDX-License-Identifier: AGPL-3.0
+#
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive/)
+# Copyright (c) 2026 PufferDrive, licensed under the MIT license.
+
 import time
 import json
 import numpy as np
@@ -14,7 +21,7 @@ def test_simulator_raw():
     num_agents = 32
 
     # ---- Run simulation ----
-    env = Drive(num_agents=num_agents, num_maps=1, episode_length=91, map_dir="resources/drive/binaries")
+    env = Drive(num_agents=num_agents, num_maps=1, scenario_length=91, split="training")
     obs, _ = env.reset()
     tick = 0
 

@@ -1,3 +1,10 @@
+# Copyright (c) 2026 Copyright holder of the paper "Scaling RL for Autonomous Driving Is Not Enough: A Behavior Benchmark for True Generalization" submitted to NeurIPS2026 for review.
+# SPDX-License-Identifier: AGPL-3.0
+#
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive/)
+# Copyright (c) 2026 PufferDrive, licensed under the MIT license.
+
 # Debug command:
 #    DEBUG=1 python setup.py build_ext --inplace --force
 #    CUDA_VISIBLE_DEVICES=None LD_PRELOAD=$(gcc -print-file-name=libasan.so) python3.12 -m pufferlib.clean_pufferl eval --train.device cpu
@@ -160,9 +167,11 @@ if system == "Linux":
         "-Wno-alloc-size-larger-than",
         "-Wno-implicit-function-declaration",
         "-fmax-errors=3",
+        "-fopenmp",  # OpenMP for parallel vec_step
     ]
     extra_link_args += [
         "-Bsymbolic-functions",
+        "-fopenmp",  # OpenMP for parallel vec_step
     ]
     if not NO_OCEAN:
         download_raylib("raylib-5.5_linux_amd64", ".tar.gz")
@@ -312,6 +321,13 @@ install_requires = [
     "gym==0.23",
     "gymnasium==0.29.1",
     "pettingzoo==1.24.1",
+    "tensorflow==2.20.0",
+    "waymo-open-dataset-tf-2-11-0==1.6.1",
+    "scipy==1.17.0",
+    "pillow==11.3.0",
+    "msgpack==1.1.2",
+    "torch-geometric==2.7.0",
+    "torch-cluster==1.6.3",
 ]
 
 if not NO_TRAIN:
@@ -327,7 +343,6 @@ if not NO_TRAIN:
         "neptune",
         "wandb",
         "matplotlib",
-        "tqdm",
     ]
 
 setup(

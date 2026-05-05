@@ -1,0 +1,10 @@
+pufferdrive_transformer_planner:
+  _target_: pufferlib.nuplan_integration.planner.PufferDrivePlanner
+  weights_path: ${oc.env:PUFFERDRIVE_WEIGHTS_PATH}
+  input_size: 64
+  hidden_size: 256
+  device: cpu
+  stochastic: false
+  trajectory_steps: 80
+  trajectory_dt: 0.1
+  policy_name: DriveTransformer

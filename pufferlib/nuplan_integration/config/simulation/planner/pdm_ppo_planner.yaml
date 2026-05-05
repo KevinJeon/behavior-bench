@@ -1,0 +1,17 @@
+pdm_ppo_planner:
+  _target_: pufferlib.nuplan_integration.pdm_ppo_planner.PDMPPONuPlanPlanner
+  weights_path: ${oc.env:PUFFERDRIVE_WEIGHTS_PATH}
+  ensemble_weights: ${oc.env:PUFFERDRIVE_ENSEMBLE_WEIGHTS,}
+  input_size: 64
+  hidden_size: 256
+  device: cpu
+  stochastic: false
+  epistemic_threshold: 0.1
+  pdm_min_steps: 1
+  switch_mode: pdm_score
+  value_variance_threshold: 0.1
+  pdm_velocity_fractions: "0.2,0.4,0.6,0.8,1.0"
+  pdm_lateral_offsets: "-1.0,1.0"
+  pdm_idm_desired_velocity: 15.0
+  trajectory_steps: 80
+  trajectory_dt: 0.1
