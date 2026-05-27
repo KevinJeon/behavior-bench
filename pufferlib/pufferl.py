@@ -285,7 +285,9 @@ class PuffeRL:
         self._adv_filter_mask = None
         self._adv_filter_retention = 0.0
         self._adv_filter_threshold_value = 0.0
-
+        if config.get("use_pbt"):
+            self._total_actions_buffer = np.zeros((n, 1), dtype=np.int64)
+            self.pbt_ego_segments = torch.zeros(self.segments, dtype=torch.bool, device=device)
     @property
     def uptime(self):
         return time.time() - self.start_time
@@ -366,6 +368,7 @@ class PuffeRL:
             ego_indices = np.asarray(info[0]["ego_indices"], dtype=np.int64)
             other_indices = np.asarray(info[0]["other_indices"], dtype=np.int64)
             o_ego = o[ego_indices]
+            o_ego_device = o_ego.to(device)
             r_ego = r[ego_indices]
             d_ego = d[ego_indices]
             mask_ego = mask[ego_indices]
@@ -382,7 +385,7 @@ class PuffeRL:
                 if config["use_rnn"]:
                     state["lstm_h"] = self.lstm_h[env_id.start]
                     state["lstm_c"] = self.lstm_c[env_id.start]
-                logits_ego, value_ego = self.policy.forward_eval(o_ego.to(device), ego_state)
+                logits_ego, value_ego = self.policy.forward_eval(o_ego_device, ego_state)
                 action_ego, logprob_ego, _ = pufferlib.pytorch.sample_logits(logits_ego)
                 r_ego = torch.clamp(r_ego, -1, 1)
 
@@ -394,8 +397,11 @@ class PuffeRL:
                     self.lstm_h[env_id.start] = state["lstm_h"]
                     self.lstm_c[env_id.start] = state["lstm_c"]
             l = self.ep_lengths[env_id.start].item()
-            batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
-            ego_batch_rows = slice(batch_rows.start, batch_rows.stop)
+            local_ego_mask = np.zeros(len(o), dtype=bool)
+            local_ego_mask[ego_indices] = True
+
+            batch_rows = self.ep_indices[agent_slice]
+            ego_batch_rows = batch_rows[torch.as_tensor(local_ego_mask, device=device)]
             if config["cpu_offload"]:
                 self.observations[ego_batch_rows, l] = o_ego
             else:
@@ -408,6 +414,8 @@ class PuffeRL:
             self.values[ego_batch_rows, l] = value_ego.flatten()
             self.truncations[ego_batch_rows, l] = t_ego.float()
 
+            self.pbt_ego_segments[batch_rows] = False
+            self.pbt_ego_segments[ego_batch_rows] = True
             self.ep_lengths[env_id] += 1
             if l + 1 >= config["bptt_horizon"]:
                 num_full = env_id.stop - env_id.start
@@ -437,6 +445,52 @@ class PuffeRL:
         # Extra sync loop for next-state value estimation
         chunk = self.vecenv.agents_per_worker * self.vecenv.workers_per_batch
         num_agents = self.vecenv.num_agents
+        for start in range(0, num_agents, chunk):
+            end = start + chunk
+            agent_slice = slice (start, end)
+            obs, r, d, _, mask, truncations = self.vecenv.sync_get_observations(agent_slice, timeout=30.0)
+            batch_rows = self.ep_indices[agent_slice]
+            ego_row_mask = self.pbt_ego_segments[batch_rows]
+
+            if not ego_row_mask.any():
+                continue
+            o = torch.as_tensor(obs)
+            r = torch.as_tensor(r).to(device)
+            d = torch.as_tensor(d).to(device)
+
+            o_ego = o[ego_row_mask.cpu().numpy()]
+            o_ego_device = o_ego.to(device)
+            r_ego = torch.clamp(r[ego_row_mask], -1, 1)
+            d_ego = d[ego_row_mask]
+            mask_ego = mask[ego_row_mask.cpu().numpy()]
+            ego_batch_rows = batch_rows[ego_row_mask]
+
+            with torch.no_grad():
+                r = torch.clamp(r, -1, 1)
+                if config["cpu_offload"]:
+                    self.observations[ego_batch_rows, l+1] = o_ego
+                else:
+                    self.observations[ego_batch_rows, l+1] = o_ego_device
+
+                self.rewards[ego_batch_rows, l+1] = r_ego
+
+            with torch.no_grad(), self.amp_context:
+                ego_state = dict(
+                    reward=r_ego,
+                    done=d_ego,
+                    env_id=ego_batch_rows,
+                    mask=mask_ego,
+                )
+                if config["use_rnn"]:
+                    ego_state["lstm_h"] = self.lstm_h[ego_batch_rows.start]
+                    ego_state["lstm_c"] = self.lstm_c[ego_batch_rows.start]
+                _, value_ego = self.policy.forward_eval(
+                    o_ego_device,
+                    ego_state,
+                )
+                self.values[ego_batch_rows, l+1] = value_ego.flatten()
+
+        profile("eval_misc", epoch)
         
     def evaluate_pbt_reactive(self):
         pass

@@ -169,7 +169,7 @@ class Drive(pufferlib.PufferEnv):
         # When idm_others is enabled, only ego (1 agent per map) is PPO-controlled
         if self.idm_others and max_controlled_agents < 0:
             max_controlled_agents = 1
-
+        self.seed = seed
         # Observation space calculation
         if dynamics_model == "jerk" or self.emit_jerk_ego_obs:
             self.ego_features = binding.EGO_FEATURES_JERK
@@ -316,7 +316,7 @@ class Drive(pufferlib.PufferEnv):
         self.num_envs = num_envs
         # TODO: PBT indices sampling
         if self.control_mode_str == "control_pbt":
-            self._sample_pbt_roles()
+            self._sample_pbt_indices()
         super().__init__(buf=buf)
         # Per-step reward breakdown buffer (one row per agent). C env writes
         # each component's contribution to the slot RC_* (see drive.h);
@@ -394,7 +394,7 @@ class Drive(pufferlib.PufferEnv):
                 reward_components=self.reward_components[cur:nxt],
                 reward_components_raw=self.reward_components_raw[cur:nxt],
                 # TODO: PBT
-                ego_local_indices=ego_local_indices
+                ego_local_indices=ego_local_indices,
                 **self._extra_c_kwargs(),
             )
             env_ids.append(env_id)
@@ -412,7 +412,7 @@ class Drive(pufferlib.PufferEnv):
         return self.observations, [info]
 
     def _sample_pbt_indices(self):
-        rng = np.random.default_rng(self.pbt_seed + self._pbt_generation)
+        rng = np.random.default_rng(self.seed + self._pbt_generation)
         ego_indices = []
 
         for start, end in zip(self.agent_offsets[:-1], self.agent_offsets[1:]):
@@ -528,7 +528,7 @@ class Drive(pufferlib.PufferEnv):
                 reward_components=self.reward_components[cur:nxt],
                 reward_components_raw=self.reward_components_raw[cur:nxt],
                 # TODO: PBT
-                ego_local_indices=ego_local_indices
+                ego_local_indices=ego_local_indices,
                 **self._extra_c_kwargs(),
             )
             env_ids.append(env_id)
@@ -542,7 +542,7 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         self.actions[:] = actions
         if self.pbt_mode == "replay":
-            self.actions[self.other_indices_arr] = self.replay_actions[self.other_indices_arr, self.tick, :]
+            self.actions[self.other_indices] = self.replay_actions[self.other_indices, self.tick, :]
         # reset environment, if resample_frequency is reached, you do not need to step in this case!
         if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
             self.resample_maps()
