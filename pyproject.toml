@@ -226,6 +226,12 @@ cleanrl = [
     'tyro==0.8.6',
 ]
 
+# Waymo TFRecord preprocessing (data_utils/womd/*). Not needed for training or WOSAC eval.
+womd = [
+    'tensorflow==2.11.0',
+    'waymo-open-dataset-tf-2-11-0==1.6.1',
+]
+
 [project.scripts]
 puffer = "pufferlib.pufferl:main"
 
@@ -238,3 +244,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
+
+# torch-cluster compiles CUDA/C++ extensions and imports torch in setup.py
+[tool.uv.extra-build-dependencies]
+torch-cluster = ["torch"]

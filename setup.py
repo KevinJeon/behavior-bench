@@ -321,18 +321,16 @@ install_requires = [
     "gym==0.23",
     "gymnasium==0.29.1",
     "pettingzoo==1.24.1",
-    "tensorflow==2.20.0",
-    "waymo-open-dataset-tf-2-11-0==1.6.1",
     "scipy==1.17.0",
     "pillow==11.3.0",
     "msgpack==1.1.2",
-    "torch-geometric==2.7.0",
-    "torch-cluster==1.6.3",
 ]
 
 if not NO_TRAIN:
     install_requires += [
         "torch",
+        "torch-geometric==2.7.0",
+        "torch-cluster==1.6.3",
         "psutil",
         "nvidia-ml-py",
         "rich",
