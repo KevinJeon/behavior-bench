@@ -97,7 +97,7 @@ class Drive(pufferlib.PufferEnv):
                                # For traffic: either a dict (single profile) or
                                # a list of dicts/tuples (multiple profiles,
                                # cycled per-agent by entity index).
-        pbt_mode="reactive",
+        pbt_mode="none", # none, reactive, replay, save-population
         ego_ratio=0.0,
         population_path=None,
     ):
@@ -561,14 +561,15 @@ class Drive(pufferlib.PufferEnv):
                     # print(log)
             if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0: # self.tick just got increased!
                 self.truncations[:] = 1.0 # truncations are the ones which are after time out right??
-
-        if len(info) == 0:
-            info = [{"agent_offsets": self.agent_offsets, "map_ids": self.map_ids, "num_envs": self.num_envs, "ego_indices": self.ego_indices}]
-        else:
-            info[0]["agent_offsets"] = self.agent_offsets
-            info[0]["map_ids"] = self.map_ids
-            info[0]["num_envs"] = self.num_envs
-            info[0]["ego_indices"] = self.ego_indices
+        if self.pbt_mode != "none":
+            print("self.pbt_mode", self.pbt_mode)
+            if len(info) == 0:
+                info = [{"agent_offsets": self.agent_offsets, "map_ids": self.map_ids, "num_envs": self.num_envs, "ego_indices": self.ego_indices}]
+            else:
+                info[0]["agent_offsets"] = self.agent_offsets
+                info[0]["map_ids"] = self.map_ids
+                info[0]["num_envs"] = self.num_envs
+                info[0]["ego_indices"] = self.ego_indices
         if self.pbt_mode == "reactive":
             info[0]["other_indices"] = self.other_indices 
 
