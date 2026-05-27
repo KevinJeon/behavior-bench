@@ -465,6 +465,8 @@ class Drive(pufferlib.PufferEnv):
         # TODO: pbt
         if self.control_mode_str == "control_pbt":
             self._sample_pbt_indices()
+            if self.pbt_mode == "replay":
+                self._allocate_replay(self.num_agents, self.map_ids)
         env_ids = []
         seed = np.random.randint(0, 2**32 - 1)
         for i in range(num_envs):

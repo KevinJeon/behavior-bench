@@ -285,9 +285,9 @@ class PuffeRL:
         self._adv_filter_mask = None
         self._adv_filter_retention = 0.0
         self._adv_filter_threshold_value = 0.0
-        if config.get("use_pbt"):
-            self._total_actions_buffer = np.zeros((n, 1), dtype=np.int64)
-            self.pbt_ego_segments = torch.zeros(self.segments, dtype=torch.bool, device=device)
+        if self.use_pbt:
+            self.pbt_ego_mask = torch.zeros((self.segments, horizon), dtype=torch.bool, device=device,)
+
     @property
     def uptime(self):
         return time.time() - self.start_time
@@ -306,191 +306,11 @@ class PuffeRL:
     _VIDEO_NUM_SCENARIOS = 5  # number of scenarios rolled out per video capture
 
     def evaluate(self):
-        if self.use_pbt:
-            if self.pbt_mode == "replay":
-                return self.evaluate_pbt_replay()
+        if self.use_pbt and self.pbt_mode == "reactive":
             return self.evaluate_pbt_reactive()
 
         return self.evaluate_normal()
 
-    def evaluate_pbt_replay(self):
-        driver_env = getattr(self.vecenv, "driver_env", None)
-        video_disabled = os.environ.get("PUFFER_DISABLE_VIDEO", "0") not in ("0", "", "false", "False")
-        self._capture_video = (
-            not video_disabled
-            and driver_env
-            and (self.global_step == 0
-                 or self.global_step >= self._next_video_log_step)
-        )
-        self._video_frames = []
-
-        profile = self.profile
-        epoch = self.epoch
-        profile("eval", epoch)
-        profile("eval_misc", epoch, nest=True)
-
-        config = self.config
-        device = config["device"]
-
-        if config["use_rnn"]:
-            for k in self.lstm_h:
-                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
-                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
-
-        # Opponent pool: setup for this epoch
-        _opp_pool_active = False
-        if self.opponent_pool and len(self.opponent_pool_snapshots) > 0 and self.epoch >= self.opponent_pool_warmup_epochs:
-            _opp_pool_active = True
-            self.opponent_segments.zero_()
-            n_opp = int(self.total_agents * self.opponent_pool_fraction)
-            perm = torch.randperm(self.total_agents, device=device)
-            self._opp_mask = torch.zeros(self.total_agents, dtype=torch.bool, device=device)
-            self._opp_mask[perm[:n_opp]] = True
-            snap_idx = random.randint(0, len(self.opponent_pool_snapshots) - 1)
-            self._opponent_pool_shadow.load_state_dict(self.opponent_pool_snapshots[snap_idx])
-
-        self.full_rows = 0
-        while self.full_rows < self.segments:
-            profile("env", epoch)
-            o, r, d, t, info, env_id, mask = self.vecenv.recv()
-            profile("eval_misc", epoch)
-            env_id = slice(env_id[0], env_id[-1] + 1)
-
-            done_mask = d + t  # TODO: Handle truncations separately
-
-            profile("eval_copy", epoch)
-            o = torch.as_tensor(o)
-            o_device = o.to(device)  # , non_blocking=True)
-            r = torch.as_tensor(r).to(device)  # , non_blocking=True)
-            d = torch.as_tensor(d).to(device)  # , non_blocking=True)
-            t = torch.as_tensor(t).to(device)  # , non_blocking=True)
-
-            ego_indices = np.asarray(info[0]["ego_indices"], dtype=np.int64)
-            other_indices = np.asarray(info[0]["other_indices"], dtype=np.int64)
-            o_ego = o[ego_indices]
-            o_ego_device = o_ego.to(device)
-            r_ego = r[ego_indices]
-            d_ego = d[ego_indices]
-            mask_ego = mask[ego_indices]
-            t_ego = t[ego_indices]
-            self.global_step += int(mask_ego.sum())
-            with torch.no_grad(), self.amp_context:
-                state = dict(
-                    reward=r,
-                    done=d,
-                    env_id=env_id,
-                    mask=mask,
-                )
-
-                if config["use_rnn"]:
-                    state["lstm_h"] = self.lstm_h[env_id.start]
-                    state["lstm_c"] = self.lstm_c[env_id.start]
-                logits_ego, value_ego = self.policy.forward_eval(o_ego_device, ego_state)
-                action_ego, logprob_ego, _ = pufferlib.pytorch.sample_logits(logits_ego)
-                r_ego = torch.clamp(r_ego, -1, 1)
-
-            profile("eval_copy", epoch)
-            with torch.no_grad():
-                if config["use_rnn"]:
-                    state["lstm_h"][t_ego, :] = 0.0 # state got truncated -> set it to 0!
-                    state["lstm_c"][t_ego, :] = 0.0
-                    self.lstm_h[env_id.start] = state["lstm_h"]
-                    self.lstm_c[env_id.start] = state["lstm_c"]
-            l = self.ep_lengths[env_id.start].item()
-            local_ego_mask = np.zeros(len(o), dtype=bool)
-            local_ego_mask[ego_indices] = True
-
-            batch_rows = self.ep_indices[agent_slice]
-            ego_batch_rows = batch_rows[torch.as_tensor(local_ego_mask, device=device)]
-            if config["cpu_offload"]:
-                self.observations[ego_batch_rows, l] = o_ego
-            else:
-                self.observations[ego_batch_rows, l] = o_ego_device
-            # stack transitions only ego
-            self.actions[ego_batch_rows, l] = action_ego
-            self.logprobs[ego_batch_rows, l] = logprob_ego
-            self.rewards[ego_batch_rows, l] = r_ego
-            self.terminals[ego_batch_rows, l] = d_ego.float()
-            self.values[ego_batch_rows, l] = value_ego.flatten()
-            self.truncations[ego_batch_rows, l] = t_ego.float()
-
-            self.pbt_ego_segments[batch_rows] = False
-            self.pbt_ego_segments[ego_batch_rows] = True
-            self.ep_lengths[env_id] += 1
-            if l + 1 >= config["bptt_horizon"]:
-                num_full = env_id.stop - env_id.start
-                self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config["device"]).int()
-                self.ep_lengths[env_id] = 0
-                self.free_idx += num_full
-                self.full_rows += num_full
-
-            action_ego = action_ego.cpu().numpy()
-            if isinstance(logits_ego, torch.distributions.Normal):
-                action_ego = np.clip(action_ego, self.vecenv.action_space.low, self.vecenv.action_space.high)
-            total_actions = self._total_actions_buffer
-            total_actions[ego_indices] = action_ego       
-            profile("eval_misc", epoch)
-            for i in info:
-                for k, v in pufferlib.unroll_nested_dict(i):
-                    if isinstance(v, np.ndarray):
-                        v = v.tolist()
-                    elif isinstance(v, (list, tuple)):
-                        self.stats[k].extend(v)
-                    else:
-                        self.stats[k].append(v)
-
-            profile("env", epoch)      
-            self.vecenv.send(total_actions)
-
-        # Extra sync loop for next-state value estimation
-        chunk = self.vecenv.agents_per_worker * self.vecenv.workers_per_batch
-        num_agents = self.vecenv.num_agents
-        for start in range(0, num_agents, chunk):
-            end = start + chunk
-            agent_slice = slice (start, end)
-            obs, r, d, _, mask, truncations = self.vecenv.sync_get_observations(agent_slice, timeout=30.0)
-            batch_rows = self.ep_indices[agent_slice]
-            ego_row_mask = self.pbt_ego_segments[batch_rows]
-
-            if not ego_row_mask.any():
-                continue
-            o = torch.as_tensor(obs)
-            r = torch.as_tensor(r).to(device)
-            d = torch.as_tensor(d).to(device)
-
-            o_ego = o[ego_row_mask.cpu().numpy()]
-            o_ego_device = o_ego.to(device)
-            r_ego = torch.clamp(r[ego_row_mask], -1, 1)
-            d_ego = d[ego_row_mask]
-            mask_ego = mask[ego_row_mask.cpu().numpy()]
-            ego_batch_rows = batch_rows[ego_row_mask]
-
-            with torch.no_grad():
-                r = torch.clamp(r, -1, 1)
-                if config["cpu_offload"]:
-                    self.observations[ego_batch_rows, l+1] = o_ego
-                else:
-                    self.observations[ego_batch_rows, l+1] = o_ego_device
-
-                self.rewards[ego_batch_rows, l+1] = r_ego
-
-            with torch.no_grad(), self.amp_context:
-                ego_state = dict(
-                    reward=r_ego,
-                    done=d_ego,
-                    env_id=ego_batch_rows,
-                    mask=mask_ego,
-                )
-                if config["use_rnn"]:
-                    ego_state["lstm_h"] = self.lstm_h[ego_batch_rows.start]
-                    ego_state["lstm_c"] = self.lstm_c[ego_batch_rows.start]
-                _, value_ego = self.policy.forward_eval(
-                    o_ego_device,
-                    ego_state,
-                )
-                self.values[ego_batch_rows, l+1] = value_ego.flatten()
-
-        profile("eval_misc", epoch)
         
     def evaluate_pbt_reactive(self):
         pass
@@ -535,6 +355,8 @@ class PuffeRL:
             snap_idx = random.randint(0, len(self.opponent_pool_snapshots) - 1)
             self._opponent_pool_shadow.load_state_dict(self.opponent_pool_snapshots[snap_idx])
 
+        if self.use_pbt and self.pbt_mode == "replay":
+            self.pbt_ego_mask.zero_()
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile("env", epoch)
@@ -543,7 +365,17 @@ class PuffeRL:
             env_id = slice(env_id[0], env_id[-1] + 1)
 
             done_mask = d + t  # TODO: Handle truncations separately
-            self.global_step += int(mask.sum())
+
+            local_ego_mask = None
+            if self.use_pbt and self.pbt_mode == "replay":
+                ego_indices = np.asarray(info[0]["ego_indices"], dtype=np.int64)
+
+                local_ego_mask = np.zeros(len(o), dtype=bool)
+                local_ego_mask[ego_indices] = True
+
+                self.global_step += int(mask[local_ego_mask].sum())
+            else:
+                self.global_step += int(mask.sum())
 
             profile("eval_copy", epoch)
             o = torch.as_tensor(o)
@@ -611,6 +443,12 @@ class PuffeRL:
                 self.values[batch_rows, l] = value.flatten()
                 self.truncations[batch_rows, l] = t.float()
 
+                if self.use_pbt and self.pbt_mode == "replay":
+                    self.pbt_ego_mask[batch_rows, l] = torch.as_tensor(
+                        local_ego_mask,
+                        device=device,
+                        dtype=torch.bool,
+                    )
                 # Mark opponent segments for advantage masking
                 if _opp_pool_active:
                     self.opponent_segments[batch_rows] = self._opp_mask[env_id]
@@ -860,9 +698,14 @@ class PuffeRL:
             # Zero out opponent segments so they are not sampled for training
             if self.opponent_pool:
                 masked_advantages = masked_advantages * ~self.opponent_segments.unsqueeze(1)
+            if self.use_pbt:
+                masked_advantages = masked_advantages * self.pbt_ego_segments.unsqueeze(1)
+                
             if self._adv_filter_enabled:
                 if self.opponent_pool:
                     valid_seg = (~self.opponent_segments).float()
+                elif self.use_pbt:
+                    valid_seg = (valid_seg * self.pbt_ego_segments).float()
                 else:
                     valid_seg = torch.ones(self.segments, device=device)
                 uniform_probs = valid_seg / valid_seg.sum().clamp(min=1e-8)
@@ -986,6 +829,8 @@ class PuffeRL:
                 loss_mask = (~invalid_mb_mask) & mb_filter_mask
             else:
                 loss_mask = (~invalid_mb_mask)
+            if self.use_pbt:
+                loss_mask = loss_mask & self.pbt_ego_segments[idx].unsqueeze(1)
             loss_mask_f = loss_mask.float()
 
             pg_denom = (loss_mask_f * mb_prio).sum().clamp(min=1e-8)
@@ -1050,8 +895,16 @@ class PuffeRL:
         if config["anneal_lr"]:
             self.scheduler.step()
 
-        y_pred = self.values[:, :-1].flatten()
-        y_true = advantages.flatten() + self.values[:, :-1].flatten()
+        if self.use_pbt:
+            valid_rows = self.pbt_ego_segments
+            y_pred = self.values[valid_rows, :-1].flatten()
+            y_true = (
+                advantages[valid_rows].flatten()
+                + self.values[valid_rows, :-1].flatten()
+            )
+        else:
+            y_pred = self.values[:, :-1].flatten()
+            y_true = advantages.flatten() + self.values[:, :-1].flatten()
         var_y = y_true.var()
         explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
         losses["explained_variance"] = explained_var.item()
