@@ -79,6 +79,12 @@ class PuffeRL:
         # DDP rank (0 when not using torchrun). Used to gate rank-0-only side effects.
         self._ddp_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+        # TODO: pbt 기능
+        self.use_pbt = bool(config.get("use_pbt", False))
+        self.pbt_mode = config.get("pbt_mode", "reactive")
+        self.ego_ratio = float(config.get("ego_ratio", 0.0))
+
+
         # Reproducibility
         seed = config["seed"]
         # random.seed(seed)
@@ -298,6 +304,144 @@ class PuffeRL:
     _VIDEO_NUM_SCENARIOS = 5  # number of scenarios rolled out per video capture
 
     def evaluate(self):
+        if self.use_pbt:
+            if self.pbt_mode == "replay":
+                return self.evaluate_pbt_replay()
+            return self.evaluate_pbt_reactive()
+
+        return self.evaluate_normal()
+
+    def evaluate_pbt_replay(self):
+        driver_env = getattr(self.vecenv, "driver_env", None)
+        video_disabled = os.environ.get("PUFFER_DISABLE_VIDEO", "0") not in ("0", "", "false", "False")
+        self._capture_video = (
+            not video_disabled
+            and driver_env
+            and (self.global_step == 0
+                 or self.global_step >= self._next_video_log_step)
+        )
+        self._video_frames = []
+
+        profile = self.profile
+        epoch = self.epoch
+        profile("eval", epoch)
+        profile("eval_misc", epoch, nest=True)
+
+        config = self.config
+        device = config["device"]
+
+        if config["use_rnn"]:
+            for k in self.lstm_h:
+                self.lstm_h[k] = torch.zeros(self.lstm_h[k].shape, device=device)
+                self.lstm_c[k] = torch.zeros(self.lstm_c[k].shape, device=device)
+
+        # Opponent pool: setup for this epoch
+        _opp_pool_active = False
+        if self.opponent_pool and len(self.opponent_pool_snapshots) > 0 and self.epoch >= self.opponent_pool_warmup_epochs:
+            _opp_pool_active = True
+            self.opponent_segments.zero_()
+            n_opp = int(self.total_agents * self.opponent_pool_fraction)
+            perm = torch.randperm(self.total_agents, device=device)
+            self._opp_mask = torch.zeros(self.total_agents, dtype=torch.bool, device=device)
+            self._opp_mask[perm[:n_opp]] = True
+            snap_idx = random.randint(0, len(self.opponent_pool_snapshots) - 1)
+            self._opponent_pool_shadow.load_state_dict(self.opponent_pool_snapshots[snap_idx])
+
+        self.full_rows = 0
+        while self.full_rows < self.segments:
+            profile("env", epoch)
+            o, r, d, t, info, env_id, mask = self.vecenv.recv()
+            profile("eval_misc", epoch)
+            env_id = slice(env_id[0], env_id[-1] + 1)
+
+            done_mask = d + t  # TODO: Handle truncations separately
+
+            profile("eval_copy", epoch)
+            o = torch.as_tensor(o)
+            o_device = o.to(device)  # , non_blocking=True)
+            r = torch.as_tensor(r).to(device)  # , non_blocking=True)
+            d = torch.as_tensor(d).to(device)  # , non_blocking=True)
+            t = torch.as_tensor(t).to(device)  # , non_blocking=True)
+
+            ego_indices = np.asarray(info[0]["ego_indices"], dtype=np.int64)
+            other_indices = np.asarray(info[0]["other_indices"], dtype=np.int64)
+            o_ego = o[ego_indices]
+            r_ego = r[ego_indices]
+            d_ego = d[ego_indices]
+            mask_ego = mask[ego_indices]
+            t_ego = t[ego_indices]
+            self.global_step += int(mask_ego.sum())
+            with torch.no_grad(), self.amp_context:
+                state = dict(
+                    reward=r,
+                    done=d,
+                    env_id=env_id,
+                    mask=mask,
+                )
+
+                if config["use_rnn"]:
+                    state["lstm_h"] = self.lstm_h[env_id.start]
+                    state["lstm_c"] = self.lstm_c[env_id.start]
+                logits_ego, value_ego = self.policy.forward_eval(o_ego.to(device), ego_state)
+                action_ego, logprob_ego, _ = pufferlib.pytorch.sample_logits(logits_ego)
+                r_ego = torch.clamp(r_ego, -1, 1)
+
+            profile("eval_copy", epoch)
+            with torch.no_grad():
+                if config["use_rnn"]:
+                    state["lstm_h"][t_ego, :] = 0.0 # state got truncated -> set it to 0!
+                    state["lstm_c"][t_ego, :] = 0.0
+                    self.lstm_h[env_id.start] = state["lstm_h"]
+                    self.lstm_c[env_id.start] = state["lstm_c"]
+            l = self.ep_lengths[env_id.start].item()
+            batch_rows = slice(self.ep_indices[env_id.start].item(), 1 + self.ep_indices[env_id.stop - 1].item())
+            ego_batch_rows = slice(batch_rows.start, batch_rows.stop)
+            if config["cpu_offload"]:
+                self.observations[ego_batch_rows, l] = o_ego
+            else:
+                self.observations[ego_batch_rows, l] = o_ego_device
+            # stack transitions only ego
+            self.actions[ego_batch_rows, l] = action_ego
+            self.logprobs[ego_batch_rows, l] = logprob_ego
+            self.rewards[ego_batch_rows, l] = r_ego
+            self.terminals[ego_batch_rows, l] = d_ego.float()
+            self.values[ego_batch_rows, l] = value_ego.flatten()
+            self.truncations[ego_batch_rows, l] = t_ego.float()
+
+            self.ep_lengths[env_id] += 1
+            if l + 1 >= config["bptt_horizon"]:
+                num_full = env_id.stop - env_id.start
+                self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config["device"]).int()
+                self.ep_lengths[env_id] = 0
+                self.free_idx += num_full
+                self.full_rows += num_full
+
+            action_ego = action_ego.cpu().numpy()
+            if isinstance(logits_ego, torch.distributions.Normal):
+                action_ego = np.clip(action_ego, self.vecenv.action_space.low, self.vecenv.action_space.high)
+            total_actions = self._total_actions_buffer
+            total_actions[ego_indices] = action_ego       
+            profile("eval_misc", epoch)
+            for i in info:
+                for k, v in pufferlib.unroll_nested_dict(i):
+                    if isinstance(v, np.ndarray):
+                        v = v.tolist()
+                    elif isinstance(v, (list, tuple)):
+                        self.stats[k].extend(v)
+                    else:
+                        self.stats[k].append(v)
+
+            profile("env", epoch)      
+            self.vecenv.send(total_actions)
+
+        # Extra sync loop for next-state value estimation
+        chunk = self.vecenv.agents_per_worker * self.vecenv.workers_per_batch
+        num_agents = self.vecenv.num_agents
+        
+    def evaluate_pbt_reactive(self):
+        pass
+
+    def evaluate_normal(self):
         # Decide whether to capture training scene video this epoch. Under DDP
         # every rank must enter the same code path (same NCCL collective order),
         # so the video block runs on all ranks in lockstep; only rank 0 actually

@@ -805,6 +805,17 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->map_name = strdup(map_file);
     env->init_steps = init_steps;
     env->timestep = init_steps;
+    env->num_ego_local = 0;
+    PyObject *ego_local_obj = kwargs ? PyDict_GetItemString(kwargs, "ego_local_indices") : NULL;
+    if (ego_local_obj && PyList_Check(ego_local_obj)) {
+        Py_ssize_t n = PyList_Size(ego_local_obj);
+        if (n > MAX_AGENTS)
+            n = MAX_AGENTS;
+        for (Py_ssize_t j = 0; j < n; j++) {
+            env->ego_local_indices[env->num_ego_local++] = (int)PyLong_AsLong(PyList_GetItem(ego_local_obj, j));
+        }
+    }
+
     init(env);
     return 0;
 }
@@ -830,6 +841,15 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "goals_sampled_this_episode", log->goals_sampled_this_episode);
     assign_to_dict(dict, "goals_reached_this_episode", log->goals_reached_this_episode);
     assign_to_dict(dict, "speed_at_goal", log->speed_at_goal);
+    // ego log
+    assign_to_dict(dict, "ego_speed_at_goal", log->ego_speed_at_goal);
+    assign_to_dict(dict, "ego_lane_alignment_rate", log->ego_lane_alignment_rate);
+    assign_to_dict(dict, "ego_offroad_rate", log->ego_offroad_rate);
+    assign_to_dict(dict, "ego_collision_rate", log->ego_collision_rate);
+    assign_to_dict(dict, "ego_offroad_per_agent", log->ego_offroad_per_agent);
+    assign_to_dict(dict, "ego_collisions_per_agent", log->ego_collisions_per_agent);
+    assign_to_dict(dict, "ego_score", log->ego_score);
+    assign_to_dict(dict, "ego_n", log->ego_n);
     // assign_to_dict(dict, "avg_displacement_error", log->avg_displacement_error);
     return 0;
 }

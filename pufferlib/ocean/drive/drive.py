@@ -97,6 +97,9 @@ class Drive(pufferlib.PufferEnv):
                                # For traffic: either a dict (single profile) or
                                # a list of dicts/tuples (multiple profiles,
                                # cycled per-agent by entity index).
+        pbt_mode="reactive",
+        ego_ratio=0.0,
+        population_path=None,
     ):
         # env
         self.dt = dt
@@ -158,6 +161,11 @@ class Drive(pufferlib.PufferEnv):
         # list of dicts, or list of 9-tuples in the documented field order.
         self.creward_traffic = self._normalize_creward_traffic(creward_traffic)
 
+        # TODO: PBT options
+        self.pbt_mode = pbt_mode
+        self.ego_ratio = float(ego_ratio)
+        self.population_path = population_path
+        self._pbt_generation = 0
         # When idm_others is enabled, only ego (1 agent per map) is PPO-controlled
         if self.idm_others and max_controlled_agents < 0:
             max_controlled_agents = 1
@@ -208,9 +216,11 @@ class Drive(pufferlib.PufferEnv):
             self.control_mode = 3
         elif self.control_mode_str == "control_evaluation":
             self.control_mode = 4
+        elif self.control_mode_str == "control_pbt":
+            self.control_mode = 5
         else:
             raise ValueError(
-                f"control_mode must be one of 'control_vehicles', 'control_wosac', 'control_evaluation', or 'control_agents'. Got: {self.control_mode_str}"
+                f"control_mode must be one of 'control_vehicles', 'control_wosac', 'control_evaluation', 'control_pbt', or 'control_agents'. Got: {self.control_mode_str}"
             )
         if self.init_mode_str == "create_all_valid":
             self.init_mode = 0
@@ -287,6 +297,7 @@ class Drive(pufferlib.PufferEnv):
             split=split,
             data_root=data_root,
             init_mode=self.init_mode,
+            ego_ratio=ego_ratio, #todo: 추가해야함
             control_mode=self.control_mode,
             init_steps=self.init_steps,
             max_controlled_agents=self.max_controlled_agents,
@@ -297,13 +308,15 @@ class Drive(pufferlib.PufferEnv):
             map_id=self.map_id,
             **self._extra_c_kwargs(),
         )
-
         # agent_offsets[-1] = actual PPO agent count from my_shared.
         # With traffic mix, this is less than num_agents (scaled by ppo_fraction).
         self.num_agents = agent_offsets[-1] if (use_all_maps or self.map_id >= 0 or self.mix_traffic) else num_agents
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
+        # TODO: PBT indices sampling
+        if self.control_mode_str == "control_pbt":
+            self._sample_pbt_roles()
         super().__init__(buf=buf)
         # Per-step reward breakdown buffer (one row per agent). C env writes
         # each component's contribution to the slot RC_* (see drive.h);
@@ -321,6 +334,13 @@ class Drive(pufferlib.PufferEnv):
         for i in range(num_envs):
             cur = agent_offsets[i]
             nxt = agent_offsets[i + 1]
+            ego_local_indices = []
+            if self.control_mode_str == "control_pbt":
+                ego_local_indices = (
+                    self.ego_indices[
+                        (self.ego_indices >= cur) & (self.ego_indices < nxt)
+                    ] - cur
+                ).astype(np.int32).tolist()
             env_id = binding.env_init(
                 self.observations[cur:nxt],
                 self.actions[cur:nxt],
@@ -373,6 +393,8 @@ class Drive(pufferlib.PufferEnv):
                 max_obs_partners=self.max_obs_partners,
                 reward_components=self.reward_components[cur:nxt],
                 reward_components_raw=self.reward_components_raw[cur:nxt],
+                # TODO: PBT
+                ego_local_indices=ego_local_indices
                 **self._extra_c_kwargs(),
             )
             env_ids.append(env_id)
@@ -382,7 +404,39 @@ class Drive(pufferlib.PufferEnv):
     def reset(self, seed=0):
         binding.vec_reset(self.c_envs, seed)
         self.tick = 0
-        return self.observations, []
+        info = {}
+        if self.control_mode_str == "control_pbt":
+            info["ego_indices"] = self.ego_indices
+            info["other_indices"] = self.other_indices
+
+        return self.observations, [info]
+
+    def _sample_pbt_indices(self):
+        rng = np.random.default_rng(self.pbt_seed + self._pbt_generation)
+        ego_indices = []
+
+        for start, end in zip(self.agent_offsets[:-1], self.agent_offsets[1:]):
+            num_agents_for_map = end - start
+            if num_agents_for_map <= 0:
+                continue
+
+            num_ego = int(np.floor(num_agents_for_map * self.ego_ratio + 0.5))
+            num_ego = max(1, min(num_ego, num_agents_for_map))
+
+            selected = rng.choice(
+                np.arange(start, end, dtype=np.int64),
+                size=num_ego,
+                replace=False,
+            )
+            ego_indices.extend(selected.tolist())
+
+        self.ego_indices = np.asarray(sorted(ego_indices), dtype=np.int64)
+
+        other_mask = np.ones(self.num_agents, dtype=bool)
+        other_mask[self.ego_indices] = False
+        self.other_indices = np.flatnonzero(other_mask).astype(np.int64)
+
+        self._pbt_generation += 1
 
     def resample_maps(self):
         """Resample environment maps. Closes current envs and creates new ones."""
@@ -408,11 +462,21 @@ class Drive(pufferlib.PufferEnv):
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
+        # TODO: pbt
+        if self.control_mode_str == "control_pbt":
+            self._sample_pbt_indices()
         env_ids = []
         seed = np.random.randint(0, 2**32 - 1)
         for i in range(num_envs):
             cur = agent_offsets[i]
             nxt = agent_offsets[i + 1]
+            ego_local_indices = []
+            if self.control_mode_str == "control_pbt":
+                ego_local_indices = (
+                    self.ego_indices[
+                        (self.ego_indices >= cur) & (self.ego_indices < nxt)
+                    ] - cur
+                ).astype(np.int32).tolist()
             env_id = binding.env_init(
                 self.observations[cur:nxt],
                 self.actions[cur:nxt],
@@ -463,6 +527,8 @@ class Drive(pufferlib.PufferEnv):
                 max_obs_partners=self.max_obs_partners,
                 reward_components=self.reward_components[cur:nxt],
                 reward_components_raw=self.reward_components_raw[cur:nxt],
+                # TODO: PBT
+                ego_local_indices=ego_local_indices
                 **self._extra_c_kwargs(),
             )
             env_ids.append(env_id)
@@ -475,6 +541,8 @@ class Drive(pufferlib.PufferEnv):
         self.terminals[:] = 0
         self.truncations[:] = 0
         self.actions[:] = actions
+        if self.pbt_mode == "replay":
+            self.actions[self.other_indices_arr] = self.replay_actions[self.other_indices_arr, self.tick, :]
         # reset environment, if resample_frequency is reached, you do not need to step in this case!
         if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
             self.resample_maps()
@@ -492,7 +560,15 @@ class Drive(pufferlib.PufferEnv):
             if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0: # self.tick just got increased!
                 self.truncations[:] = 1.0 # truncations are the ones which are after time out right??
 
-            
+        if len(info) == 0:
+            info = [{"agent_offsets": self.agent_offsets, "map_ids": self.map_ids, "num_envs": self.num_envs, "ego_indices": self.ego_indices}]
+        else:
+            info[0]["agent_offsets"] = self.agent_offsets
+            info[0]["map_ids"] = self.map_ids
+            info[0]["num_envs"] = self.num_envs
+            info[0]["ego_indices"] = self.ego_indices
+        if self.pbt_mode == "reactive":
+            info[0]["other_indices"] = self.other_indices 
 
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
 

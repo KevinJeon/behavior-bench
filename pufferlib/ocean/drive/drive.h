@@ -59,6 +59,7 @@
 #define CONTROL_WOSAC 2
 #define CONTROL_SDC_ONLY 3
 #define CONTROL_EVALUATION 4
+#define CONTROL_PBT 5 // TODO: PBT
 
 // Minimum distance to goal position
 #define MIN_DISTANCE_TO_GOAL 2.0f
@@ -222,6 +223,16 @@ struct Log {
     float active_agent_count;
     float expert_static_agent_count;
     float static_agent_count;
+    // only record first agent
+    float ego_speed_at_goal;
+    float ego_lane_alignment_rate;
+    float ego_offroad_rate;
+    float ego_collision_rate;
+    float ego_completion_rate;
+    float ego_offroad_per_agent;
+    float ego_collisions_per_agent;
+    float ego_score;
+    float ego_n;
 };
 
 typedef struct Entity Entity;
@@ -404,6 +415,8 @@ struct Drive {
     int num_agents;
     int active_agent_count;
     int *active_agent_indices;
+    int num_ego_local;
+    int ego_local_indices[MAX_AGENTS];
     int action_type;
     int human_agent_idx;
     Entity *entities;
@@ -501,6 +514,14 @@ struct Drive {
 // Forward declarations for functions defined later
 void build_lane_routes(Drive* env);
 
+static inline int is_ego_local(Drive *env, int i) {
+    for (int j = 0; j < env->num_ego_local; j++) {
+        if (env->ego_local_indices[j] == i)
+            return 1;
+    }
+    return 0;
+}
+
 void add_log(Drive *env) {
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity *e = &env->entities[env->active_agent_indices[i]];
@@ -549,6 +570,17 @@ void add_log(Drive *env) {
         env->log.speed_at_goal += env->logs[i].speed_at_goal;
         env->log.episode_length += env->logs[i].episode_length;
         env->log.episode_return += env->logs[i].episode_return;
+        // TODO: PBT
+        if ((env->num_ego_local > 0 && is_ego_local(env, i)) || (env->num_ego_local == 0 && i == 0)) {
+            env->log.ego_score += (frac_goal_reached > threshold && !collision_occurred) ? 1.0f : 0.0f;
+            env->log.ego_offroad_rate += offroad;
+            env->log.ego_collision_rate += collided;
+            env->log.ego_speed_at_goal += env->logs[i].speed_at_goal;
+            env->log.ego_lane_alignment_rate += lane_aligned;
+            env->log.ego_collisions_per_agent += collisions_per_agent;
+            env->log.ego_offroad_per_agent += offroad_per_agent;
+            env->log.ego_n += 1;
+        }
         // Log composition counts per agent so vec_log averaging recovers the per-env value
         env->log.active_agent_count += env->active_agent_count;
         env->log.expert_static_agent_count += env->expert_static_agent_count;
@@ -1595,6 +1627,9 @@ bool should_control_agent(Drive *env, int agent_idx, bool skip_capacity_check) {
 
     switch (env->control_mode) {
     case CONTROL_WOSAC:
+    case CONTROL_PBT:
+        return is_vehicle;
+        
     case CONTROL_EVALUATION:
         // Valid types only, ignore expert flag and goal distance
         return is_vehicle;
