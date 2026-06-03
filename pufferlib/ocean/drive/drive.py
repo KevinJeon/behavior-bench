@@ -471,25 +471,126 @@ class Drive(pufferlib.PufferEnv):
         self._pbt_generation += 1
 
     def _allocate_replay(self, num_agents, map_ids):
+        """Copy saved rollout actions into replay_actions aligned by map_id."""
+        map_ids = np.asarray(map_ids, dtype=np.int64).ravel()
+        saved_map_ids = np.asarray(self.actions_map_id, dtype=np.int64).ravel()
+        saved_offsets = np.asarray(self.actions_agent_offsets, dtype=np.int64).ravel()
+        num_rollout = int(self.other_actions.shape[0])
+        verbose = os.environ.get("PUFFER_DEBUG_REPLAY_ALLOC", "0").lower() in (
+            "1", "true", "yes",
+        )
+
         self.replay_actions = np.zeros((num_agents, self.resample_frequency, 1), dtype=np.int32)
         agent_ind = 0
-        for _, map_id in enumerate(map_ids):
-            num_rollout = self.other_actions.shape[0]
+        matched_maps = 0
+        missing_maps = []
+        truncated_maps = []
+        rows = []
+
+        env_set = set(map_ids.tolist())
+        saved_set = set(saved_map_ids.tolist())
+        only_env = sorted(env_set - saved_set)
+        only_saved = sorted(saved_set - env_set)
+
+        if verbose:
+            print(
+                f"[allocate_replay] env num_agents={num_agents} env_maps={len(map_ids)} "
+                f"saved_maps={len(saved_map_ids)} saved_total_agents={saved_offsets[-1]} "
+                f"rollouts={num_rollout} horizon={self.resample_frequency}",
+                flush=True,
+            )
+            if only_env or only_saved:
+                print(
+                    f"[allocate_replay] map_id set diff: only_in_env={only_env[:20]}"
+                    f"{'...' if len(only_env) > 20 else ''} "
+                    f"only_in_saved={only_saved[:20]}"
+                    f"{'...' if len(only_saved) > 20 else ''}",
+                    flush=True,
+                )
+
+        for env_map_idx, map_id in enumerate(map_ids):
+            hits = np.where(saved_map_ids == map_id)[0]
+            if hits.size == 0:
+                missing_maps.append(int(map_id))
+                if verbose:
+                    print(
+                        f"[allocate_replay] map_id={map_id} (env slot {env_map_idx}): "
+                        "MISSING in saved actions_map_id",
+                        flush=True,
+                    )
+                continue
+
             sample_ind = np.random.randint(0, num_rollout)
-            map_indices = np.where(self.actions_map_id == map_id)[0][0]
-            agent_offsets = self.actions_agent_offsets[map_indices:map_indices+2]
-            num_agents_for_map = agent_offsets[1] - agent_offsets[0]
-            if agent_ind + num_agents_for_map> num_agents:
+            map_indices = int(hits[0])
+            src_start = int(saved_offsets[map_indices])
+            src_end = int(saved_offsets[map_indices + 1])
+            num_agents_for_map = src_end - src_start
+            requested = num_agents_for_map
+            if agent_ind + num_agents_for_map > num_agents:
                 num_agents_for_map = num_agents - agent_ind
-            self.replay_actions[agent_ind:agent_ind+num_agents_for_map] = self.other_actions[sample_ind, agent_offsets[0]:agent_offsets[0] + num_agents_for_map].copy()
+                truncated_maps.append(
+                    (int(map_id), requested, num_agents_for_map)
+                )
+
+            if num_agents_for_map <= 0:
+                break
+
+            self.replay_actions[agent_ind:agent_ind + num_agents_for_map] = self.other_actions[
+                sample_ind, src_start:src_start + num_agents_for_map
+            ].copy()
+            matched_maps += 1
+            if verbose:
+                rows.append(
+                    f"  map_id={map_id:3d} rollout={sample_ind} "
+                    f"src=[{src_start}:{src_start + num_agents_for_map}) "
+                    f"dst=[{agent_ind}:{agent_ind + num_agents_for_map}) "
+                    f"agents={num_agents_for_map}/{requested}"
+                )
             agent_ind += num_agents_for_map
+
+        if verbose and rows:
+            print("[allocate_replay] per-map assignment:", flush=True)
+            for line in rows[:30]:
+                print(line, flush=True)
+            if len(rows) > 30:
+                print(f"  ... ({len(rows) - 30} more maps)", flush=True)
+
+        unfilled = num_agents - agent_ind
+        print(
+            f"[allocate_replay] matched {matched_maps}/{len(map_ids)} env maps, "
+            f"filled {agent_ind}/{num_agents} agent slots, "
+            f"missing_map_ids={len(missing_maps)}, truncated={len(truncated_maps)}",
+            flush=True,
+        )
+        if missing_maps:
+            print(
+                f"[allocate_replay] WARN missing map_ids (no saved replay): "
+                f"{missing_maps[:15]}{'...' if len(missing_maps) > 15 else ''}",
+                flush=True,
+            )
+        if truncated_maps:
+            print(
+                f"[allocate_replay] WARN truncated (env num_agents too small): "
+                f"{truncated_maps[:5]}{'...' if len(truncated_maps) > 5 else ''}",
+                flush=True,
+            )
+        if unfilled > 0:
+            print(
+                f"[allocate_replay] WARN {unfilled} agent slots left zero "
+                f"(env maps did not cover all slots)",
+                flush=True,
+            )
 
     def resample_maps(self):
         """Resample environment maps. Closes current envs and creates new ones."""
         self.tick = 0
         binding.vec_close(self.c_envs)
+        shared_num_agents = self.num_agents
+        if self.mix_traffic and self.ppo_fraction < 1.0:
+            shared_num_agents = max(1, int(self.num_agents * self.ppo_fraction))
+
         agent_offsets, map_ids, num_envs = binding.shared(
-            num_agents=self.num_agents,
+            num_agents=shared_num_agents,
             num_maps=self.num_maps,
             init_mode=self.init_mode,
             control_mode=self.control_mode,
@@ -498,7 +599,7 @@ class Drive(pufferlib.PufferEnv):
             goal_behavior=self.goal_behavior,
             goal_target_distance=self.goal_target_distance,
             goal_lane_change_prob=self.goal_lane_change_prob,
-            goal_speed=self.goal_speed,
+            ego_ratio=self.ego_ratio,
             split=self.split,
             data_root=self.data_root,
             use_all_maps=False,
@@ -508,11 +609,12 @@ class Drive(pufferlib.PufferEnv):
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
-        # TODO: pbt
         if self.control_mode_str == "control_pbt":
             self._sample_pbt_indices()
-            if self.pbt_mode == "replay":
-                self._allocate_replay(self.num_agents, self.map_ids)
+        elif self.pbt_mode == "replay":
+            self.other_indices = np.arange(self.num_agents, dtype=np.int64)
+        if self.pbt_mode == "replay" and hasattr(self, "other_actions"):
+            self._allocate_replay(self.num_agents, self.map_ids)
         env_ids = []
         seed = np.random.randint(0, 2**32 - 1)
         for i in range(num_envs):
@@ -590,8 +692,7 @@ class Drive(pufferlib.PufferEnv):
         self.truncations[:] = 0
         self.actions[:] = actions
         if self.pbt_mode == "replay" and hasattr(self, "replay_actions"):
-            replay_tick = self.tick % self.replay_actions.shape[1]
-            self.actions[self.other_indices] = self.replay_actions[self.other_indices, replay_tick, :]
+            self.actions[self.other_indices] = self.replay_actions[self.other_indices, self.tick, :]
         # reset environment, if resample_frequency is reached, you do not need to step in this case!
         if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
             self.resample_maps()

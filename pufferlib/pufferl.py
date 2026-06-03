@@ -86,7 +86,7 @@ class PuffeRL:
 
         # TODO: pbt 기능
         pbt_config = config.get("pbt",{})
-        self.pbt_mode = pbt_config.get("pbt_mode", "reactive")
+        self.pbt_mode = pbt_config.get("pbt_mode", "none")
         self.ego_ratio = float(pbt_config.get("ego_ratio", 0.0))
 
 
