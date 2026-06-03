@@ -68,6 +68,11 @@ signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 # Assume advantage kernel has been built if CUDA compiler is available
 ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
+# PBT/env metadata in info dict — not training metrics; skip for stats and dashboard.
+DASHBOARD_SKIP_STATS = frozenset(
+    {"agent_offsets", "map_ids", "num_envs", "ego_indices", "other_indices"}
+)
+
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
@@ -254,6 +259,7 @@ class PuffeRL:
         self.profile = Profile()
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
+        self.dashboard_stats = {}
         self.losses = {}
 
         # Dashboard
@@ -485,6 +491,8 @@ class PuffeRL:
             profile("eval_misc", epoch)
             for i in info:
                 for k, v in pufferlib.unroll_nested_dict(i):
+                    if k in DASHBOARD_SKIP_STATS:
+                        continue
                     if isinstance(v, np.ndarray):
                         v = v.tolist()
                     elif isinstance(v, (list, tuple)):
@@ -693,7 +701,7 @@ class PuffeRL:
             terminals = self.terminals.bool()
             terminals_shifted = torch.cat([torch.zeros_like(terminals[:, :1]), terminals[:, :-1]],dim=1)
             invalid_mask = terminals & terminals_shifted
-            invalid_observations = (self.observations[:, -1, 0] == -1000)# if workers were too slow to perform the action in sync_get_observations function
+            invalid_observations = (self.observations[:, -1, 0] == -1000).to(device)  # cpu_offload keeps observations on CPU
             invalid_mask[:, -1] = invalid_mask[:, -1] | invalid_observations
             invalid_mask = invalid_mask | self.truncations.bool()
 
@@ -758,6 +766,8 @@ class PuffeRL:
                               if self._adv_filter_enabled and self._adv_filter_mask is not None
                               else None)
             mb_obs = self.observations[idx]
+            if config["cpu_offload"]:
+                mb_obs = mb_obs.to(device, non_blocking=True)
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
             mb_rewards = self.rewards[idx]
@@ -1007,11 +1017,15 @@ class PuffeRL:
     def mean_and_log(self):
         config = self.config
         for k in list(self.stats.keys()):
+            if k in DASHBOARD_SKIP_STATS:
+                del self.stats[k]
+                continue
             v = self.stats[k]
             try:
                 v = np.mean(v)
             except:
                 del self.stats[k]
+                continue
 
             self.stats[k] = v
 
@@ -1171,15 +1185,16 @@ class PuffeRL:
         right.add_column(f"{c1}Value", justify="right", width=10)
         i = 0
 
-        if self.stats:
-            self.last_stats = self.stats
-
-        for metric, value in (self.stats or self.last_stats).items():
-            try:  # Discard non-numeric values
-                int(value)
-            except:
+        for metric, value in self.stats.items():
+            if metric in DASHBOARD_SKIP_STATS:
                 continue
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                continue
+            self.dashboard_stats[metric] = value
 
+        for metric, value in sorted(self.dashboard_stats.items()):
             u = left if i % 2 == 0 else right
             u.add_row(f"{c2}{metric}", f"{b2}{value:.3f}")
             i += 1
