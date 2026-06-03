@@ -314,9 +314,39 @@ class Drive(pufferlib.PufferEnv):
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
+        # Provide safe defaults so replay/pbt code paths can attach metadata
+        # even when control_mode is not control_pbt.
+        self.ego_indices = np.empty(0, dtype=np.int64)
+        self.other_indices = np.arange(self.num_agents, dtype=np.int64)
         # TODO: PBT indices sampling
         if self.control_mode_str == "control_pbt":
             self._sample_pbt_indices()
+        if self.pbt_mode == "replay":
+            if self.population_path is None:
+                raise FileNotFoundError("pbt_mode=replay requires pbt.population_path")
+            replay_dir = os.path.join(self.population_path, "replay")
+            actions_npy = os.path.join(replay_dir, "other_actions.npy")
+            offsets_npy = os.path.join(replay_dir, "agent_offsets.npy")
+            map_ids_npy = os.path.join(replay_dir, "map_ids.npy")
+            replay_npz = os.path.join(replay_dir, "other_actions.npz")
+
+            if all(os.path.exists(p) for p in (actions_npy, offsets_npy, map_ids_npy)):
+                self.other_actions = np.load(actions_npy, allow_pickle=True)
+                self.actions_agent_offsets = np.load(offsets_npy, allow_pickle=True)
+                self.actions_map_id = np.load(map_ids_npy, allow_pickle=True)
+            elif os.path.exists(replay_npz):
+                npz = np.load(replay_npz, allow_pickle=True)
+                self.other_actions = npz["actions"]
+                self.actions_agent_offsets = npz["agent_offsets"]
+                self.actions_map_id = npz["map_ids"]
+                del npz
+            else:
+                raise FileNotFoundError(
+                    f"Replay data not found in {replay_dir}. "
+                    "Expected other_actions.npy + agent_offsets.npy + map_ids.npy "
+                    "or legacy other_actions.npz"
+                )
+            self._allocate_replay(self.num_agents, self.map_ids)
         super().__init__(buf=buf)
         # Per-step reward breakdown buffer (one row per agent). C env writes
         # each component's contribution to the slot RC_* (see drive.h);
@@ -421,7 +451,9 @@ class Drive(pufferlib.PufferEnv):
                 continue
 
             num_ego = int(np.floor(num_agents_for_map * self.ego_ratio + 0.5))
-            num_ego = max(1, min(num_ego, num_agents_for_map))
+            num_ego = min(num_ego, num_agents_for_map)
+            if num_ego <= 0:
+                continue
 
             selected = rng.choice(
                 np.arange(start, end, dtype=np.int64),
@@ -437,6 +469,20 @@ class Drive(pufferlib.PufferEnv):
         self.other_indices = np.flatnonzero(other_mask).astype(np.int64)
 
         self._pbt_generation += 1
+
+    def _allocate_replay(self, num_agents, map_ids):
+        self.replay_actions = np.zeros((num_agents, self.resample_frequency, 1), dtype=np.int32)
+        agent_ind = 0
+        for _, map_id in enumerate(map_ids):
+            num_rollout = self.other_actions.shape[0]
+            sample_ind = np.random.randint(0, num_rollout)
+            map_indices = np.where(self.actions_map_id == map_id)[0][0]
+            agent_offsets = self.actions_agent_offsets[map_indices:map_indices+2]
+            num_agents_for_map = agent_offsets[1] - agent_offsets[0]
+            if agent_ind + num_agents_for_map> num_agents:
+                num_agents_for_map = num_agents - agent_ind
+            self.replay_actions[agent_ind:agent_ind+num_agents_for_map] = self.other_actions[sample_ind, agent_offsets[0]:agent_offsets[0] + num_agents_for_map].copy()
+            agent_ind += num_agents_for_map
 
     def resample_maps(self):
         """Resample environment maps. Closes current envs and creates new ones."""
@@ -543,8 +589,9 @@ class Drive(pufferlib.PufferEnv):
         self.terminals[:] = 0
         self.truncations[:] = 0
         self.actions[:] = actions
-        if self.pbt_mode == "replay":
-            self.actions[self.other_indices] = self.replay_actions[self.other_indices, self.tick, :]
+        if self.pbt_mode == "replay" and hasattr(self, "replay_actions"):
+            replay_tick = self.tick % self.replay_actions.shape[1]
+            self.actions[self.other_indices] = self.replay_actions[self.other_indices, replay_tick, :]
         # reset environment, if resample_frequency is reached, you do not need to step in this case!
         if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
             self.resample_maps()
@@ -562,7 +609,6 @@ class Drive(pufferlib.PufferEnv):
             if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0: # self.tick just got increased!
                 self.truncations[:] = 1.0 # truncations are the ones which are after time out right??
         if self.pbt_mode != "none":
-            print("self.pbt_mode", self.pbt_mode)
             if len(info) == 0:
                 info = [{"agent_offsets": self.agent_offsets, "map_ids": self.map_ids, "num_envs": self.num_envs, "ego_indices": self.ego_indices}]
             else:

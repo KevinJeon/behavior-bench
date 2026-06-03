@@ -80,9 +80,9 @@ class PuffeRL:
         self._ddp_rank = int(os.environ.get("LOCAL_RANK", 0))
 
         # TODO: pbt 기능
-        self.use_pbt = bool(config.get("use_pbt", False))
-        self.pbt_mode = config.get("pbt_mode", "reactive")
-        self.ego_ratio = float(config.get("ego_ratio", 0.0))
+        pbt_config = config.get("pbt",{})
+        self.pbt_mode = pbt_config.get("pbt_mode", "reactive")
+        self.ego_ratio = float(pbt_config.get("ego_ratio", 0.0))
 
 
         # Reproducibility
@@ -285,9 +285,9 @@ class PuffeRL:
         self._adv_filter_mask = None
         self._adv_filter_retention = 0.0
         self._adv_filter_threshold_value = 0.0
-        if self.use_pbt:
+        if self.pbt_mode != "none":
             self.pbt_ego_mask = torch.zeros((self.segments, horizon), dtype=torch.bool, device=device,)
-
+            
     @property
     def uptime(self):
         return time.time() - self.start_time
@@ -306,7 +306,7 @@ class PuffeRL:
     _VIDEO_NUM_SCENARIOS = 5  # number of scenarios rolled out per video capture
 
     def evaluate(self):
-        if self.use_pbt and self.pbt_mode == "reactive":
+        if self.pbt_mode == "reactive":
             return self.evaluate_pbt_reactive()
 
         return self.evaluate_normal()
@@ -314,6 +314,21 @@ class PuffeRL:
         
     def evaluate_pbt_reactive(self):
         pass
+
+    def _extract_replay_ego_mask(self, info, batch_size, fallback_mask=None):
+        """Build per-batch ego mask from env info with a safe fallback."""
+        if info and isinstance(info[0], dict) and "ego_indices" in info[0]:
+            ego_indices = np.asarray(info[0]["ego_indices"], dtype=np.int64)
+            ego_indices = ego_indices[(ego_indices >= 0) & (ego_indices < batch_size)]
+            local_mask = np.zeros(batch_size, dtype=bool)
+            local_mask[ego_indices] = True
+            return local_mask
+
+        if fallback_mask is not None and len(fallback_mask) == batch_size:
+            return fallback_mask
+
+        # Missing replay metadata: keep rollout valid by masking everything out.
+        return np.zeros(batch_size, dtype=bool)
 
     def evaluate_normal(self):
         # Decide whether to capture training scene video this epoch. Under DDP
@@ -354,9 +369,9 @@ class PuffeRL:
             self._opp_mask[perm[:n_opp]] = True
             snap_idx = random.randint(0, len(self.opponent_pool_snapshots) - 1)
             self._opponent_pool_shadow.load_state_dict(self.opponent_pool_snapshots[snap_idx])
-
-        if self.use_pbt and self.pbt_mode == "replay":
+        if self.pbt_mode == "replay":
             self.pbt_ego_mask.zero_()
+        replay_last_ego_mask = None
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile("env", epoch)
@@ -367,12 +382,13 @@ class PuffeRL:
             done_mask = d + t  # TODO: Handle truncations separately
 
             local_ego_mask = None
-            if self.use_pbt and self.pbt_mode == "replay":
-                ego_indices = np.asarray(info[0]["ego_indices"], dtype=np.int64)
-
-                local_ego_mask = np.zeros(len(o), dtype=bool)
-                local_ego_mask[ego_indices] = True
-
+            if self.pbt_mode == "replay":
+                local_ego_mask = self._extract_replay_ego_mask(
+                    info,
+                    len(o),
+                    fallback_mask=replay_last_ego_mask,
+                )
+                replay_last_ego_mask = local_ego_mask
                 self.global_step += int(mask[local_ego_mask].sum())
             else:
                 self.global_step += int(mask.sum())
@@ -443,7 +459,7 @@ class PuffeRL:
                 self.values[batch_rows, l] = value.flatten()
                 self.truncations[batch_rows, l] = t.float()
 
-                if self.use_pbt and self.pbt_mode == "replay":
+                if self.pbt_mode == "replay":
                     self.pbt_ego_mask[batch_rows, l] = torch.as_tensor(
                         local_ego_mask,
                         device=device,
@@ -604,15 +620,22 @@ class PuffeRL:
                 if frames:
                     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
                     tmp.close()
-                    imageio.mimsave(tmp.name, frames, fps=10)
-                    self.logger.log(
-                        {"training_scene/video": wandb.Video(tmp.name, format="mp4", fps=10)},
-                        self.global_step,
-                    )
-                    print(
-                        f"[VideoLogger] Recorded {len(frames)} frames across "
-                        f"{self._VIDEO_NUM_SCENARIOS} scenarios on driver_env"
-                    )
+                    try:
+                        imageio.mimsave(tmp.name, frames, fps=10)
+                        self.logger.log(
+                            {"training_scene/video": wandb.Video(tmp.name, format="mp4", fps=10)},
+                            self.global_step,
+                        )
+                        print(
+                            f"[VideoLogger] Recorded {len(frames)} frames across "
+                            f"{self._VIDEO_NUM_SCENARIOS} scenarios on driver_env"
+                        )
+                    except Exception as e:
+                        # Keep training alive when ffmpeg/pyav backend is unavailable.
+                        print(
+                            "[VideoLogger] skipped video logging: "
+                            f"{e}. Install imageio[ffmpeg] or set PUFFER_DISABLE_VIDEO=1."
+                        )
             except Exception as e:
                 print(f"[VideoLogger] error: {e}")
                 import traceback
@@ -643,6 +666,7 @@ class PuffeRL:
         for mb in range(self.total_minibatches):
             profile("train_misc", epoch, nest=True)
             self.amp_context.__enter__()
+            sample_segments = min(self.minibatch_segments, self.segments)
             # if self.truncations.sum() > 0:
             #     print("Wuhuu there were some truncations!!")
             shape = self.truncations.shape
@@ -698,19 +722,28 @@ class PuffeRL:
             # Zero out opponent segments so they are not sampled for training
             if self.opponent_pool:
                 masked_advantages = masked_advantages * ~self.opponent_segments.unsqueeze(1)
-            if self.use_pbt:
-                masked_advantages = masked_advantages * self.pbt_ego_segments.unsqueeze(1)
+            if self.pbt_mode != "none":
+                masked_advantages = masked_advantages * self.pbt_ego_mask.float()
                 
             if self._adv_filter_enabled:
                 if self.opponent_pool:
                     valid_seg = (~self.opponent_segments).float()
-                elif self.use_pbt:
-                    valid_seg = (valid_seg * self.pbt_ego_segments).float()
+                elif self.pbt_mode != "none":
+                    valid_seg = self.pbt_ego_mask.any(dim=1).float()
                 else:
                     valid_seg = torch.ones(self.segments, device=device)
-                uniform_probs = valid_seg / valid_seg.sum().clamp(min=1e-8)
-                idx = torch.multinomial(uniform_probs, self.minibatch_segments)
-                mb_prio = torch.ones(self.minibatch_segments, 1, device=device)
+                if valid_seg.sum() <= 0:
+                    # ego_ratio=0 can make replay mask all-false; fall back to
+                    # uniform sampling across all segments to avoid CUDA asserts.
+                    uniform_probs = torch.full(
+                        (self.segments,),
+                        1.0 / max(self.segments, 1),
+                        device=device,
+                    )
+                else:
+                    uniform_probs = valid_seg / valid_seg.sum()
+                idx = torch.multinomial(uniform_probs, sample_segments, replacement=False)
+                mb_prio = torch.ones(sample_segments, 1, device=device)
             else:
                 adv = masked_advantages.abs().sum(axis=1) # sum across sequence length
                 valid_steps = (~invalid_mask).sum(axis=1) +1e-6
@@ -718,7 +751,7 @@ class PuffeRL:
                 # TODO: This may be to harsh -> normalizing it before can help to not produce extreme probabilities with **a!
                 prio_weights = torch.nan_to_num(adv_avg**a, 0, 0, 0)
                 prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
-                idx = torch.multinomial(prio_probs, self.minibatch_segments) # indices are drawn by important agents and not timesteps
+                idx = torch.multinomial(prio_probs, sample_segments, replacement=False) # indices are drawn by important agents and not timesteps
                 mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
             # Slice the advantage-filter mask (Gigaflow paper Alg. 1) for this minibatch
             mb_filter_mask = (self._adv_filter_mask[idx]
@@ -829,8 +862,8 @@ class PuffeRL:
                 loss_mask = (~invalid_mb_mask) & mb_filter_mask
             else:
                 loss_mask = (~invalid_mb_mask)
-            if self.use_pbt:
-                loss_mask = loss_mask & self.pbt_ego_segments[idx].unsqueeze(1)
+            if self.pbt_mode != "none":
+                loss_mask = loss_mask & self.pbt_ego_mask[idx]
             loss_mask_f = loss_mask.float()
 
             pg_denom = (loss_mask_f * mb_prio).sum().clamp(min=1e-8)
@@ -895,8 +928,8 @@ class PuffeRL:
         if config["anneal_lr"]:
             self.scheduler.step()
 
-        if self.use_pbt:
-            valid_rows = self.pbt_ego_segments
+        if self.pbt_mode != "none":
+            valid_rows = self.pbt_ego_mask.any(dim=1)
             y_pred = self.values[valid_rows, :-1].flatten()
             y_true = (
                 advantages[valid_rows].flatten()
@@ -1454,7 +1487,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     elif args["wandb"] and _ddp_rank == 0:
         logger = WandbLogger(args, load_id=args.get("load_id"))
 
-    train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}))
+    train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}), pbt=args.get("pbt", {}))
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     # Restore global_step and epoch from trainer_state when resuming
@@ -1880,7 +1913,12 @@ def load_env(env_name, args):
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
-    return pufferlib.vector.make(make_env, env_kwargs=args["env"], **args["vec"])
+    env_kwargs = dict(args["env"])
+    pbt_kwargs = args.get("pbt", {})
+    for key in ("pbt_mode", "ego_ratio", "population_path"):
+        if key in pbt_kwargs and key not in env_kwargs:
+            env_kwargs[key] = pbt_kwargs[key]
+    return pufferlib.vector.make(make_env, env_kwargs=env_kwargs, **args["vec"])
 
 
 def load_policy(args, vecenv, env_name=""):
