@@ -10,6 +10,7 @@
 #include "env_config.h"
 #include <Python.h>
 #include <numpy/arrayobject.h>
+#include <stddef.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -591,6 +592,7 @@ static PyObject *vec_log(PyObject *self, PyObject *args) {
 
     Log aggregate = {0};
     int num_keys = sizeof(Log) / sizeof(float);
+    int first_ego_index = (int)(offsetof(Log, ego_speed_at_goal) / sizeof(float));
     for (int i = 0; i < vec->num_envs; i++) {
         Env *env = vec->envs[i];
         for (int j = 0; j < num_keys; j++) {
@@ -614,11 +616,21 @@ static PyObject *vec_log(PyObject *self, PyObject *args) {
     }
 
     float n = aggregate.n;
+    float ego_n = aggregate.ego_n;
 
-    // Average across agents
+    // Average across agents; ego_* fields use ego_n (see add_log in drive.h)
     for (int i = 0; i < num_keys; i++) {
+        if (i >= first_ego_index) {
+            if (ego_n > 0.0f) {
+                ((float *)&aggregate)[i] /= ego_n;
+            } else {
+                ((float *)&aggregate)[i] = 0.0f;
+            }
+            continue;
+        }
         ((float *)&aggregate)[i] /= n;
     }
+    aggregate.ego_n = ego_n;
 
     // Compute completion_rate from aggregated counts
     aggregate.completion_rate = aggregate.goals_reached_this_episode / aggregate.goals_sampled_this_episode;
