@@ -709,7 +709,7 @@ def plot_metric_grouped_heatmaps_from_metrics(metrics, family_names, risky_scale
                 axes[r, c] = fig.add_subplot(gs[r, 2 * c])
                 cbar_axes[r, c] = fig.add_subplot(gs[r, 2 * c + 1])
 
-        col_group_titles = ["P(Go)", "Riksy state Return", "Risky state Collision"]
+        col_group_titles = ["P(Go)", "Risky state Return", "Risky state Collision"]
         for r in range(2):
             for c in range(3):
                 metric_key = metric_layout[r][c]
